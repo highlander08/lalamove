@@ -1,0 +1,469 @@
+// ====================================================
+// CLASSE PRINCIPAL LALAMOVE + DOKAN (COMPLETA)
+// ====================================================
+
+if (!class_exists('LalamoveDokanFinal')) {
+    class LalamoveDokanFinal {
+        
+        private $api_key = 'pk_test_405b82b18afd1a3b961cb61c82e063cf';
+        private $secret = 'sk_test_8exxWZ9sH70NtO5Kt3yHsp9aDVY5OkhG0/J2hRDuxpXKkatG6OiwEZvA5Wr5TcGF';
+        private $market = 'BR';
+        private $base_url = 'https://rest.sandbox.lalamove.com';
+
+        public function __construct() {
+            add_action('admin_menu', function() {
+                if (!class_exists('WeDevs_Dokan')) {
+                    add_action('admin_notices', function() {
+                        echo '<div class="notice notice-error"><p>Lalamove: <strong>Dokan não está ativo!</strong></p></div>';
+                    });
+                    return;
+                }
+
+                $dokan_functions = WP_PLUGIN_DIR . '/dokan-lite/includes/functions.php';
+                if (file_exists($dokan_functions) && !function_exists('dokan_get_seller_id_by_product')) {
+                    require_once $dokan_functions;
+                }
+
+                add_submenu_page(
+                    'woocommerce',
+                    'Lalamove Teste',
+                    'Lalamove',
+                    'manage_options',
+                    'lalamove-final-test',
+                    [$this, 'test_page']
+                );
+
+                add_action('add_meta_boxes', [$this, 'add_meta_box']);
+            });
+
+            add_action('wp_ajax_lalamove_create_order_final', [$this, 'ajax_create_order']);
+            add_action('init', [$this, 'handle_test']);
+        }
+
+        public function test_page() {
+            if (!current_user_can('manage_options')) wp_die('Acesso negado.');
+            $orders = wc_get_orders(['limit' => 50, 'status' => ['processing', 'on-hold']]);
+            ?>
+            <div class="wrap">
+                <h1>Lalamove + Dokan - Teste Final</h1>
+                <p>Pedidos com múltiplos vendedores:</p>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead><tr><th>ID</th><th>Cliente</th><th>Vendedores</th><th>Ação</th></tr></thead>
+                    <tbody>
+                    <?php foreach ($orders as $order): 
+                        $vendors = $this->get_vendedores_from_order($order);
+                        if (count($vendors) < 1) continue;
+                    ?>
+                        <tr>
+                            <td>#<?php echo $order->get_id(); ?></td>
+                            <td><?php echo $order->get_billing_first_name(); ?></td>
+                            <td><?php echo count($vendors); ?> vendedor(es)</td>
+                            <td>
+                                <a href="<?php echo admin_url('?lalamove_final_test=' . $order->get_id()); ?>" 
+                                   class="button button-primary">Enviar Lalamove</a>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            <?php
+        }
+
+        public function handle_test() {
+            if (isset($_GET['lalamove_final_test']) && current_user_can('manage_options')) {
+                $this->test_order(intval($_GET['lalamove_final_test']));
+                die();
+            }
+        }
+
+        public function add_meta_box() {
+            add_meta_box('lalamove_final', 'Lalamove', [$this, 'meta_box'], 'shop_order', 'side', 'high');
+        }
+
+        public function meta_box($post) {
+            $order = wc_get_order($post->ID);
+            $quotation_id = get_post_meta($order->get_id(), '_lalamove_quotation_id', true);
+            $order_id = get_post_meta($order->get_id(), '_lalamove_order_id', true);
+            $status = get_post_meta($order->get_id(), '_lalamove_status', true);
+            $tracking = get_post_meta($order->get_id(), '_lalamove_share_link', true);
+
+            if ($quotation_id && !$order_id) {
+                echo '<p><strong>Cotação pronta!</strong></p>';
+                echo '<button type="button" class="button button-primary" onclick="createOrder(' . $order->get_id() . ')">Criar Ordem</button>';
+            } elseif ($order_id) {
+                echo '<p><strong>Ordem:</strong> ' . $order_id . '</p>';
+                echo '<p><strong>Status:</strong> ' . ucwords(str_replace('_', ' ', $status)) . '</p>';
+                if ($tracking) echo '<p><a href="' . $tracking . '" target="_blank">Rastrear</a></p>';
+            } else {
+                echo '<a href="' . admin_url('?lalamove_final_test=' . $order->get_id()) . '" class="button">Gerar Cotação</a>';
+            }
+
+            echo '<script>
+            function createOrder(id) {
+                fetch(ajaxurl, {
+                    method: "POST",
+                    headers: {"Content-Type": "application/x-www-form-urlencoded"},
+                    body: "action=lalamove_create_order_final&order_id=" + id + "&nonce=' . wp_create_nonce('lalamove_final') . '"
+                }).then(r => r.json()).then(d => {
+                    if (d.success) location.reload();
+                    else alert("Erro: " + d.data);
+                });
+            }
+            </script>';
+        }
+
+        public function ajax_create_order() {
+            check_ajax_referer('lalamove_final');
+            $order_id = intval($_POST['order_id']);
+            $order = wc_get_order($order_id);
+            $quotation_id = get_post_meta($order_id, '_lalamove_quotation_id', true);
+            if (!$quotation_id) wp_send_json_error('Cotação não encontrada');
+
+            $result = $this->criar_ordem_lalamove($order, $quotation_id);
+            if ($result['success']) {
+                update_post_meta($order_id, '_lalamove_order_id', $result['order_id']);
+                update_post_meta($order_id, '_lalamove_status', $result['status']);
+                update_post_meta($order_id, '_lalamove_share_link', $result['share_link']);
+                wp_send_json_success();
+            } else {
+                wp_send_json_error($result['error']);
+            }
+        }
+
+        public function test_order($order_id) {
+            if (!current_user_can('manage_options')) wp_die('Acesso negado.');
+            $order = wc_get_order($order_id);
+            if (!$order) wp_die('Pedido não encontrado');
+
+            $vendedores = $this->get_vendedores_from_order($order);
+            $cliente = $this->get_cliente_from_order($order);
+            if (empty($vendedores)) wp_die('Nenhum vendedor com endereço válido.');
+
+            $stops = $this->montar_stops_com_geocod($vendedores, $cliente);
+            if (!$stops) wp_die('Falha na geocodificação.');
+
+            $result = $this->criar_cotacao_lalamove($stops);
+            ?>
+            <div style="max-width:900px;margin:40px auto;padding:30px;background:#f9f9f9;font-family:Arial;border-radius:10px;">
+                <h1>Lalamove - Pedido #<?php echo $order_id; ?></h1>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:30px;">
+                    <div style="background:#e8f4f8;padding:20px;border-radius:8px;">
+                        <h3>Vendedores (<?php echo count($vendedores); ?>)</h3>
+                        <?php foreach ($vendedores as $v): ?>
+                            <p><strong><?php echo $v['nome']; ?></strong><br><?php echo $v['endereco']; ?> (Nº <?php echo $v['numero']; ?>)<br><small>CEP: <?php echo $v['cep']; ?></small></p>
+                        <?php endforeach; ?>
+                    </div>
+                    <div style="background:#e8f5e8;padding:20px;border-radius:8px;">
+                        <h3>Cliente</h3>
+                        <p><strong><?php echo $cliente['nome']; ?></strong><br><?php echo $cliente['endereco']; ?> (Nº <?php echo $cliente['numero']; ?>)<br><small>CEP: <?php echo $cliente['cep']; ?></small></p>
+                    </div>
+                </div>
+
+                <?php if ($result['success']): ?>
+                    <div style="background:#d4edda;padding:25px;border-radius:8px;text-align:center;">
+                        <h3>COTAÇÃO OK!</h3>
+                        <p><strong>ID:</strong> <?php echo $result['quotation_id']; ?></p>
+                        <p><strong>Preço:</strong> R$ <?php echo number_format($result['preco'], 2); ?></p>
+                        <?php update_post_meta($order_id, '_lalamove_quotation_id', $result['quotation_id']); ?>
+                        <button onclick="createOrder(<?php echo $order_id; ?>)" style="background:#28a745;color:white;padding:15px 30px;border:none;border-radius:8px;font-size:18px;cursor:pointer;">
+                            CRIAR ORDEM AGORA
+                        </button>
+                    </div>
+                <?php else: ?>
+                    <div style="background:#f8d7da;padding:25px;border-radius:8px;color:#721c24;">
+                        <h3>ERRO</h3>
+                        <pre><?php echo htmlspecialchars($result['error']); ?></pre>
+                    </div>
+                <?php endif; ?>
+            </div>
+            <script>
+            function createOrder(id) {
+                fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: 'action=lalamove_create_order_final&order_id=' + id + '&nonce=<?php echo wp_create_nonce('lalamove_final'); ?>'
+                }).then(r => r.json()).then(d => {
+                    if (d.success) {
+                        alert('Ordem criada!');
+                        location.href = '<?php echo admin_url('post.php?post=' . $order_id . '&action=edit'); ?>';
+                    } else {
+                        alert('Erro: ' + d.data);
+                    }
+                });
+            }
+            </script>
+            <?php die();
+        }
+
+        private function extrair_numero($endereco) {
+            if (preg_match('/(\d+)/', $endereco, $m)) return $m[1];
+            return '';
+        }
+
+        private function get_vendedores_from_order($order) {
+            $vendedores = [];
+            foreach ($order->get_items() as $item) {
+                $product_id = $item->get_product_id();
+                $vendor_id = function_exists('dokan_get_seller_id_by_product') ? dokan_get_seller_id_by_product($product_id) : 0;
+                if (!$vendor_id) continue;
+
+                $settings = get_user_meta($vendor_id, 'dokan_profile_settings', true);
+                if (!$settings || empty($settings['address']['street_1']) || empty($settings['address']['zip'])) continue;
+
+                $addr = $settings['address'];
+                $rua = trim($addr['street_1'] . ' ' . ($addr['street_2'] ?? ''));
+                $numero = $this->extrair_numero($rua);
+                if (!$numero) continue;
+
+                $vendedores[$vendor_id] = [
+                    'id' => $vendor_id,
+                    'nome' => function_exists('dokan') ? dokan()->vendor->get($vendor_id)->get_shop_name() : 'Vendedor',
+                    'endereco' => $rua,
+                    'numero' => $numero,
+                    'cep' => $addr['zip'],
+                    'phone' => $settings['phone'] ?? '+5585999999999'
+                ];
+            }
+            return array_values($vendedores);
+        }
+
+        private function get_cliente_from_order($order) {
+            $addr = $order->get_address('shipping');
+            $rua = trim($addr['address_1'] . ' ' . ($addr['address_2'] ?? ''));
+            $numero = $this->extrair_numero($rua);
+            $cep = $order->get_shipping_postcode() ?: $order->get_billing_postcode();
+
+            return [
+                'nome' => $order->get_formatted_shipping_full_name(),
+                'endereco' => $rua,
+                'numero' => $numero ?: 'S/N',
+                'cep' => $cep,
+                'phone' => $order->get_billing_phone()
+            ];
+        }
+
+        private function geocodificar_com_numero($endereco, $cep, $numero) {
+            $cep = preg_replace('/\D/', '', $cep);
+            if (strlen($cep) !== 8 || !$numero) return null;
+
+            $cache_key = 'geo_' . md5($cep . $numero);
+            $cached = get_transient($cache_key);
+            if ($cached) return $cached;
+
+            $viacep = wp_remote_get("https://viacep.com.br/ws/{$cep}/json/", ['timeout' => 10]);
+            if (is_wp_error($viacep)) return null;
+            $dados = json_decode(wp_remote_retrieve_body($viacep), true);
+            if (isset($dados['erro'])) return null;
+
+            $full = trim("{$dados['logradouro']}, {$numero}, {$dados['bairro']}, {$dados['localidade']}, CE");
+            $query = urlencode($full);
+            $url = "https://nominatim.openstreetmap.org/search?format=json&q={$query}&limit=1";
+
+            $geo = wp_remote_get($url, ['headers' => ['User-Agent' => 'LalamoveFinal/1.0'], 'timeout' => 15]);
+            if (is_wp_error($geo)) return null;
+
+            $result = json_decode(wp_remote_retrieve_body($geo), true);
+            if (empty($result)) return null;
+
+            $coords = ['lat' => $result[0]['lat'], 'lng' => $result[0]['lon']];
+            set_transient($cache_key, $coords, WEEK_IN_SECONDS);
+            return $coords;
+        }
+
+        // === MÉTODOS PÚBLICOS PARA TESTE MANUAL ===
+        public function montar_stops_com_geocod($vendedores, $cliente) {
+            $stops = [];
+            foreach ($vendedores as $v) {
+                $coords = $this->geocodificar_com_numero($v['endereco'], $v['cep'], $v['numero']);
+                if (!$coords) return null;
+                $stops[] = ["coordinates" => ["lat" => $coords['lat'], "lng" => $coords['lng']], "address" => $v['endereco']];
+            }
+            $coords = $this->geocodificar_com_numero($cliente['endereco'], $cliente['cep'], $cliente['numero']);
+            if (!$coords) return null;
+            $stops[] = ["coordinates" => ["lat" => $coords['lat'], "lng" => $coords['lng']], "address" => $cliente['endereco']];
+            return $stops;
+        }
+
+        public function criar_cotacao_lalamove($stops) {
+            $body = ["data" => [
+                "serviceType" => "CAR",
+                "language" => "pt_BR",
+                "stops" => $stops,
+                "isRouteOptimized" => false,
+                "item" => ["weight" => "LESS_THAN_3_KG", "categories" => ["FOOD_DELIVERY", "OTHERS"]]
+            ]];
+
+            $json = json_encode($body);
+            $time = round(microtime(true) * 1000);
+            $sig = hash_hmac('sha256', $time . "\r\nPOST\r\n/v3/quotations\r\n\r\n" . $json, $this->secret);
+            $token = $this->api_key . ':' . $time . ':' . $sig;
+
+            $response = wp_remote_post($this->base_url . '/v3/quotations', [
+                'headers' => ['Authorization' => 'hmac ' . $token, 'Market' => $this->market, 'Request-ID' => $this->uuid(), 'Content-Type' => 'application/json'],
+                'body' => $json, 'timeout' => 30
+            ]);
+
+            if (is_wp_error($response)) return ['success' => false, 'error' => $response->get_error_message()];
+            $data = json_decode(wp_remote_retrieve_body($response), true);
+            if (wp_remote_retrieve_response_code($response) !== 201) {
+                return ['success' => false, 'error' => $data['errors'][0]['message'] ?? 'Erro'];
+            }
+
+            return ['success' => true, 'quotation_id' => $data['data']['quotationId'], 'preco' => $data['data']['priceBreakdown']['total']];
+        }
+
+        public function criar_ordem_lalamove($order, $quotation_id) {
+            if (!$order) {
+                $vendedores = [
+                    ['nome' => 'Loja Centro', 'phone' => '+5585999999999'],
+                    ['nome' => 'Loja Aldeota', 'phone' => '+5585888888888']
+                ];
+                $cliente = ['nome' => 'Cliente Meireles', 'phone' => '+5585777777777'];
+            } else {
+                $vendedores = $this->get_vendedores_from_order($order);
+                $cliente = $this->get_cliente_from_order($order);
+            }
+
+            $recipients = [];
+            for ($i = 1; $i < count($vendedores); $i++) {
+                $recipients[] = [
+                    "stopId" => $this->get_stop_id($quotation_id, $i),
+                    "name" => $vendedores[$i]['nome'],
+                    "phone" => $vendedores[$i]['phone'],
+                    "remarks" => "COLETAR PACOTE"
+                ];
+            }
+            $recipients[] = [
+                "stopId" => $this->get_stop_id($quotation_id, count($vendedores)),
+                "name" => $cliente['nome'],
+                "phone" => $cliente['phone'],
+                "remarks" => "ENTREGAR " . count($vendedores) . " PACOTES"
+            ];
+
+            $body = ["data" => [
+                "quotationId" => $quotation_id,
+                "sender" => ["stopId" => $this->get_stop_id($quotation_id, 0), "name" => $vendedores[0]['nome'], "phone" => $vendedores[0]['phone']],
+                "recipients" => $recipients,
+                "isPODEnabled" => false
+            ]];
+
+            $json = json_encode($body);
+            $time = round(microtime(true) * 1000);
+            $sig = hash_hmac('sha256', $time . "\r\nPOST\r\n/v3/orders\r\n\r\n" . $json, $this->secret);
+            $token = $this->api_key . ':' . $time . ':' . $sig;
+
+            $response = wp_remote_post($this->base_url . '/v3/orders', [
+                'headers' => ['Authorization' => 'hmac ' . $token, 'Market' => $this->market, 'Request-ID' => $this->uuid(), 'Content-Type' => 'application/json'],
+                'body' => $json, 'timeout' => 30
+            ]);
+
+            if (is_wp_error($response)) return ['success' => false, 'error' => $response->get_error_message()];
+            $data = json_decode(wp_remote_retrieve_body($response), true);
+            if (wp_remote_retrieve_response_code($response) !== 201) {
+                return ['success' => false, 'error' => $data['errors'][0]['message'] ?? 'Erro'];
+            }
+
+            return ['success' => true, 'order_id' => $data['data']['orderId'], 'status' => $data['data']['status'], 'share_link' => $data['data']['shareLink'] ?? ''];
+        }
+
+        private function get_stop_id($quotation_id, $index) {
+            $cache = wp_cache_get('lalamove_stops_' . $quotation_id);
+            if ($cache) return $cache[$index] ?? '';
+
+            $time = round(microtime(true) * 1000);
+            $sig = hash_hmac('sha256', $time . "\r\nGET\r\n/v3/quotations/{$quotation_id}\r\n\r\n", $this->secret);
+            $token = $this->api_key . ':' . $time . ':' . $sig;
+
+            $response = wp_remote_get($this->base_url . "/v3/quotations/{$quotation_id}", [
+                'headers' => ['Authorization' => 'hmac ' . $token, 'Market' => $this->market, 'Request-ID' => $this->uuid()]
+            ]);
+
+            if (is_wp_error($response)) return '';
+            $data = json_decode(wp_remote_retrieve_body($response), true);
+            $stops = $data['data']['stops'] ?? [];
+            $ids = array_column($stops, 'stopId');
+            wp_cache_set('lalamove_stops_' . $quotation_id, $ids, '', 300);
+            return $ids[$index] ?? '';
+        }
+
+        private function uuid() {
+            return sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
+                mt_rand(0, 0xffff), mt_rand(0, 0xffff),
+                mt_rand(0, 0xffff), mt_rand(0, 0x0fff) | 0x4000,
+                mt_rand(0, 0x3fff) | 0x8000, mt_rand(0, 0xffff),
+                mt_rand(0, 0xffff), mt_rand(0, 0xffff)
+            );
+        }
+    }
+
+    new LalamoveDokanFinal();
+}
+
+// ====================================================
+// TESTE MANUAL: COTAÇÃO + ORDEM EM 1 CLIQUE (FORTALEZA)
+// ====================================================
+
+add_action('admin_menu', function() {
+    add_submenu_page(
+        'woocommerce',
+        'Lalamove Manual (CE)',
+        'Lalamove Manual (CE)',
+        'manage_options',
+        'lalamove-manual-ce',
+        'lalamove_manual_ce_test_page'
+    );
+});
+
+function lalamove_manual_ce_test_page() {
+    if (!current_user_can('manage_options')) wp_die('Acesso negado.');
+
+    $vendedores = [
+        ['nome' => 'Loja Centro', 'endereco' => 'Rua Major Facundo, 123', 'numero' => '123', 'cep' => '60025-100', 'phone' => '+5585999999999'],
+        ['nome' => 'Loja Aldeota', 'endereco' => 'Av. Dom Luís, 500', 'numero' => '500', 'cep' => '60160-230', 'phone' => '+5585888888888']
+    ];
+
+    $cliente = ['nome' => 'Cliente Meireles', 'endereco' => 'Av. Abolição, 2000', 'numero' => '2000', 'cep' => '60165-080', 'phone' => '+5585777777777'];
+
+    $lalamove = new LalamoveDokanFinal();
+
+    if (isset($_POST['run_full_test'])) {
+        $stops = $lalamove->montar_stops_com_geocod($vendedores, $cliente);
+        if (!$stops) {
+            echo '<div class="notice notice-error"><p>Falha na geocodificação.</p></div>';
+        } else {
+            $result = $lalamove->criar_cotacao_lalamove($stops);
+            if (!$result['success']) {
+                echo '<div class="notice notice-error"><p>Erro na cotação: ' . htmlspecialchars($result['error']) . '</p></div>';
+            } else {
+                echo '<div class="notice notice-success"><p><strong>COTAÇÃO CRIADA!</strong> ID: ' . $result['quotation_id'] . ' - R$ ' . number_format($result['preco'], 2) . '</p></div>';
+                $order_result = $lalamove->criar_ordem_lalamove(null, $result['quotation_id']);
+                if ($order_result['success']) {
+                    echo '<div class="notice notice-success"><p><strong>ORDEM CRIADA!</strong><br>ID: ' . $order_result['order_id'] . '<br>Status: ' . ucwords(str_replace('_', ' ', $order_result['status'])) . '<br><a href="' . $order_result['share_link'] . '" target="_blank">Rastrear Entrega</a></p></div>';
+                } else {
+                    echo '<div class="notice notice-error"><p>Erro na ordem: ' . htmlspecialchars($order_result['error']) . '</p></div>';
+                }
+            }
+        }
+    }
+    ?>
+
+    <div class="wrap">
+        <h1>Lalamove - Teste Completo (Fortaleza - CE)</h1>
+        <p><strong>Cotação + Ordem em 1 clique!</strong></p>
+        <form method="post">
+            <table class="form-table">
+                <tr><th><strong>Vendedores</strong></th><td>
+                    <?php foreach ($vendedores as $i => $v): ?>
+                        <p><strong>Vendedor <?= $i+1 ?>:</strong> <?= $v['nome'] ?><br><?= $v['endereco'] ?> (Nº <?= $v['numero'] ?>) - CEP: <?= $v['cep'] ?></p>
+                    <?php endforeach; ?>
+                </td></tr>
+                <tr><th><strong>Cliente</strong></th><td>
+                    <p><strong><?= $cliente['nome'] ?></strong><br><?= $cliente['endereco'] ?> (Nº <?= $cliente['numero'] ?>) - CEP: <?= $cliente['cep'] ?></p>
+                </td></tr>
+            </table>
+            <p><input type="submit" name="run_full_test" class="button button-primary button-large" value="COTAÇÃO + ORDEM AGORA"></p>
+        </form>
+    </div>
+    <?php
+}
