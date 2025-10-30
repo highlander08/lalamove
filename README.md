@@ -564,3 +564,7 @@ function testar_lalamove_multi_pickup() {
     }
 }
 add_action('init', 'testar_lalamove_multi_pickup');
+
+### versao origem fortaleza 2 vendedores 1 clientes pegando do dokan + woocommece + wordpress
+
+?
